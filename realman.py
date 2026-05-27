@@ -69,9 +69,7 @@ class RealManRobot:
         print("UDP listener bound on 0.0.0.0:8089")
 
     def move_cartesian_velocity(self, velocities: List[float]):
-        print("moving cartesian velocity with vel", velocities)
         if ROUTINE_IS_RUNNING: return
-        print("moving cartesian velocity after routine check")
 
         try:
             # Realman has a different coordinate frame than Incar, so we transform
