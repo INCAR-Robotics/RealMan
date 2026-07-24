@@ -54,8 +54,13 @@ class RealManRobotWithDH:
         if not self.handle:
             raise RuntimeError("Failed to create robot arm handle")
 
-        ret = self.robot.rm_set_tool_voltage(3)  # 0=0V, 1=5V, 2=12V, 3=24V
-        ret = self.robot.rm_set_modbus_mode(GRIPPER_PORT, GRIPPER_BAUD, 1)
+        # Separate robot & handle so that slow gripper read/writes do not interfere with arm commands
+        # (otherwise this causes heavy jittering of the arm movement)
+        self._gripper_robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
+        self._gripper_handle = self._gripper_robot.rm_create_robot_arm(ROBOT_IP, ROBOT_PORT)
+        self._gripper_robot.rm_set_tool_voltage(3)  # 0=0V, 1=5V, 2=12V, 3=24V
+        self._gripper_robot.rm_set_modbus_mode(GRIPPER_PORT, GRIPPER_BAUD, 1)
+
         time.sleep(1)
         _gripper_write(self.robot, REG_INIT, 0x01)
 
@@ -88,8 +93,11 @@ class RealManRobotWithDH:
 
         self.mod = rm_movev_canfd_mode_t()
         self.mod.follow = True
-        self.mod.trajectory_mode = 1
-        self.mod.radio = 50
+        self.mod.trajectory_mode = 0
+        # self.mod.radio = 50
+
+        self._vel_filter_alpha = 0.15  # higher = more responsive, lower = smoother
+        self._filtered_velocity = [0.0] * 6
 
         _gripper_write(self.robot, REG_FORCE, GRIPPER_FORCE_PERCENT)
 
@@ -133,28 +141,37 @@ class RealManRobotWithDH:
                     self._gripper_target = None
 
             if target is not None:
-                _gripper_write(self.robot, REG_POSITION, target)
+                _gripper_write(self._gripper_robot, REG_POSITION, target)
 
-            pos = _gripper_read(self.robot, REG_CUR_POS)
+            pos = _gripper_read(self._gripper_robot, REG_CUR_POS)
             with self._gripper_lock:
                 self._gripper_pos = pos
 
             time.sleep(0.05)
 
     def move_cartesian_velocity(self, velocities: List[float]):
-        print("moving cartesian velocity with vel", velocities)
         if ROUTINE_IS_RUNNING: return
-        print("moving cartesian velocity after routine check")
 
         try:
+            if all(v == 0 for v in velocities):
+                # stop instantly, don't let the filter coast to zero
+                self._filtered_velocity = [0.0] * 6
+            else:
+                a = self._vel_filter_alpha
+                self._filtered_velocity = [
+                    a * v + (1 - a) * f
+                    for v, f in zip(velocities, self._filtered_velocity)
+                ]
+            fv = self._filtered_velocity
+
             # Realman has a different coordinate frame than Incar, so we transform
             v = (ctypes.c_float * 6)(
-                velocities[0],
-                velocities[1],
-                velocities[2],
-                -velocities[3],
-                -velocities[4],
-                -velocities[5]
+                fv[0],
+                fv[1],
+                fv[2],
+                -fv[3],
+                -fv[4],
+                -fv[5]
             )
             self.mod.cartesian_velocity = ctypes.pointer(v)
             ret = rm_movev_canfd(self.handle, self.mod)
