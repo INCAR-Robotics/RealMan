@@ -6,8 +6,9 @@ import traceback
 from typing import List
 from Robotic_Arm.rm_robot_interface import *
 from incar_networking.robot_interface import IncarRobotInterface
+from calorimetry_routine import run_calorimetry_routine
 
-HOME_JOINT_POSITIONS = [0.0, -6.4, 0.0, 72.5, 0.0, 80.7, -98.8]
+HOME_JOINT_POSITIONS = [55.0, -65.0, -62.0, 75.0, -1.5, 49.5, -183.0] # For ODI setup
 ROUTINE_IS_RUNNING = False
 
 ROBOT_IP = "192.168.1.18"
@@ -20,6 +21,7 @@ GRIPPER_FORCE_PERCENT = 100  # 20-100%, maps to ~45-160N per jaw
 
 # Gripper commands
 REG_INIT = 0x0100
+INIT_FULL_CALIBRATION = 0xA5  # 0x01 only homes in one direction; 0xA5 closes then opens fully to re-learn the stroke
 REG_FORCE = 0x0101
 REG_POSITION = 0x0103
 REG_INIT_STATE = 0x0200
@@ -41,9 +43,26 @@ def _gripper_read(robot, addr):
         print(f"  WARNING: read 0x{addr:04X} failed, ret={ret}")
     return val
 
+
+def _gripper_wait_init(robot, timeout=10.0):
+    # REG_FORCE writes made while the gripper is still homing can be silently
+    # dropped/reset once homing completes, so block here until REG_INIT_STATE == 1.
+    # REG_INIT_STATE still reads 1 from a previous session until the gripper
+    # starts the new init, so give it a moment before polling.
+    time.sleep(0.5)
+    start = time.time()
+    while time.time() - start < timeout:
+        state = _gripper_read(robot, REG_INIT_STATE)
+        if state == 1:
+            return True
+        time.sleep(0.1)
+    print("  WARNING: gripper init did not complete within timeout")
+    return False
+
 class RealManRobotWithDH:
     def __init__(self, dt_ms: int, module_name="arm"):
         self.module_name = module_name
+        self.dt_ms = dt_ms
 
         # -----------------------------
         # 1. Create robot connection
@@ -62,7 +81,18 @@ class RealManRobotWithDH:
         self._gripper_robot.rm_set_modbus_mode(GRIPPER_PORT, GRIPPER_BAUD, 1)
 
         time.sleep(1)
-        _gripper_write(self.robot, REG_INIT, 0x01)
+        # All one-time gripper setup below goes through self._gripper_robot and must
+        # finish before the background thread starts: self.robot and self._gripper_robot
+        # are separate TCP connections to the same controller, which forwards both to the
+        # same physical RS485 line. Issuing writes on self.robot concurrently with the
+        # thread's traffic on self._gripper_robot causes Modbus receive errors (bus
+        # contention), silently corrupting whichever command loses.
+        _gripper_write(self._gripper_robot, REG_INIT, INIT_FULL_CALIBRATION)
+        _gripper_wait_init(self._gripper_robot)
+        _gripper_write(self._gripper_robot, REG_FORCE, GRIPPER_FORCE_PERCENT)
+        actual_force = _gripper_read(self._gripper_robot, REG_FORCE)
+        if actual_force != GRIPPER_FORCE_PERCENT:
+            print(f"  WARNING: gripper force readback {actual_force} != requested {GRIPPER_FORCE_PERCENT}")
 
         print("Robot connected.")
 
@@ -99,8 +129,6 @@ class RealManRobotWithDH:
         self._vel_filter_alpha = 0.15  # higher = more responsive, lower = smoother
         self._filtered_velocity = [0.0] * 6
 
-        _gripper_write(self.robot, REG_FORCE, GRIPPER_FORCE_PERCENT)
-
         print("Motion parameters configured.")
 
         # -----------------------------
@@ -125,6 +153,12 @@ class RealManRobotWithDH:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", 8089))
         print("UDP listener bound on 0.0.0.0:8089")
+
+        # Latest pose from the realtime push, so routines can read it without a TCP
+        # request/reply (those time out with ret=-2 every now and then)
+        self._state_lock = threading.Lock()
+        self._ee_pose = None
+        self._ee_pose_time = 0.0
 
     def shutdown(self):
         self._gripper_running = False
@@ -181,10 +215,29 @@ class RealManRobotWithDH:
             print(e)
 
     def move_gripper(self, gripper_zero_one: List[float]):
+        if ROUTINE_IS_RUNNING: return
+
+        gripper_zero_one = max(0.7, gripper_zero_one[0])
+        self.set_gripper_target(int((1-gripper_zero_one)*1000))  # open: 1000, close: 0
+
+    def set_gripper_target(self, target: int):
         with self._gripper_lock:
-            self._gripper_target = int((1-gripper_zero_one[0])*1000)  # open: 1000, close: 0
+            self._gripper_target = target
+
+    def get_gripper_position(self) -> int:
+        with self._gripper_lock:
+            return self._gripper_pos
+
+    def get_ee_pose(self, max_age: float = 0.5) -> List[float]:
+        """Latest tool pose [x, y, z, qw, qx, qy, qz] from the realtime UDP push."""
+        with self._state_lock:
+            pose, age = self._ee_pose, time.monotonic() - self._ee_pose_time
+        if pose is None or age > max_age:
+            raise RuntimeError(f"No fresh arm pose from the realtime push (last one {age:.1f}s old)")
+        return pose
 
     def handle_routines(self, routines: List[float]):
+        global ROUTINE_IS_RUNNING
         if ROUTINE_IS_RUNNING: return
 
         try:
@@ -192,20 +245,32 @@ class RealManRobotWithDH:
             index = next(i for i, x in enumerate(routines) if x > 0.5)
         except StopIteration:
             return
-        
+
+        # if index == 0:
+        #     def _routine():
+        #         print("Going Home")
+        #         ret = self.robot.rm_movej(HOME_JOINT_POSITIONS, 20, 0, 0, 1)
+        #         print("Going Home Completed: ", ret)
         if index == 0:
-            def _execute_routine():
-                try:
-                    print("Going Home")
-                    global ROUTINE_IS_RUNNING
-                    ROUTINE_IS_RUNNING = True
-                    ret = self.robot.rm_movej(HOME_JOINT_POSITIONS, 20, 0, 0, 1)
-                    ROUTINE_IS_RUNNING = False
-                    print("Going Home Completed: ", ret)
-                except:
-                    traceback.print_exc()
-        # Add other routines here, e.g. if index == 1: ...
-        
+            def _routine():
+                print("Running calorimetry routine")
+                run_calorimetry_routine(self)
+                print("Calorimetry routine completed")
+        # Add other routines here, e.g. elif index == 2: ...
+        else:
+            return
+
+        def _execute_routine():
+            global ROUTINE_IS_RUNNING
+            try:
+                _routine()
+            except:
+                traceback.print_exc()
+            finally:
+                ROUTINE_IS_RUNNING = False
+
+        # Set before starting the thread so a repeated trigger can't start a second routine
+        ROUTINE_IS_RUNNING = True
         routine_thread = threading.Thread(target=_execute_routine, daemon=True)
         routine_thread.start()
 
@@ -233,13 +298,15 @@ class RealManRobotWithDH:
             position = [x / 1_000_000.0 for x in position]  # micrometers -> meters
             quat = wp.get("quat", [0, 0, 0, 1])
             quat = [x / 1_000_000.0 for x in quat]          # micro units -> normalized
-            ee_pose = position + quat  # [x, y, z, qx, qy, qz, qw]
+            ee_pose = position + quat  # [x, y, z, qw, qx, qy, qz], the push sends w first
+
+            with self._state_lock:
+                self._ee_pose = ee_pose
+                self._ee_pose_time = time.monotonic()
 
             interface.set_robot_state(self.module_name, ee_pose=ee_pose, joint_pos=joint_pos)
 
-            with self._gripper_lock:
-                gripper_pos = self._gripper_pos
-            interface.set_robot_state(self.module_name + "gripper", joint_pos=[gripper_pos])
+            interface.set_robot_state("gripper", joint_pos=[self.get_gripper_position()])
 
         except Exception as e:
             print(f"publish_state_udp Exception: {e}")

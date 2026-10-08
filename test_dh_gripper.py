@@ -35,6 +35,18 @@ def _read(robot, addr):
     return val
 
 
+def wait_for_init(robot, timeout=10.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        state = _read(robot, REG_INIT_STATE)
+        print(f"  init_state={state}")
+        if state == 1:
+            return True
+        time.sleep(0.2)
+    print("  WARNING: timed out waiting for gripper init")
+    return False
+
+
 def wait_until_settled(robot, timeout=5.0):
     start = time.time()
     while time.time() - start < timeout:
@@ -64,9 +76,11 @@ def main():
 
         print("Initializing gripper...")
         _write(robot, REG_INIT, 0x01)
-        wait_until_settled(robot, timeout=10.0)
+        wait_for_init(robot, timeout=10.0)
 
         _write(robot, REG_FORCE, 50)  # 20-100 %
+        actual_force = _read(robot, REG_FORCE)
+        print(f"Force readback: {actual_force}")
 
         print("Opening...")
         _write(robot, REG_POSITION, 1000)

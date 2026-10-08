@@ -3,7 +3,7 @@ from realman_with_dh import RealManRobotWithDH
 
 if __name__ == "__main__":
     try:
-        dt_ms = 10
+        dt_ms = 20
         robot = RealManRobotWithDH(dt_ms)
         interface = IncarRobotInterface(
             dt_ms / 1000,
