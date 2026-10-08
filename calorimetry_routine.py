@@ -14,10 +14,16 @@ during the recording, so that tool frame must be active when this runs.
 """
 
 import math
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
+
+# L2 vision (powder level -> hygrostat size), see astra_calorimetry/code/vision/README.md
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "astra_calorimetry" / "code" / "vision"))
+from l2 import L2Vision
 
 ROUTINE_SPEED = 20          # movej speed percentage, 1~100
 LINEAR_SPEED = 0.08         # m/s, peak tool speed of the straight-line moves
@@ -29,7 +35,16 @@ GRIPPER_TOLERANCE = 10      # gripper counts, close enough to the target to cont
 GRIPPER_SETTLE_TIME = 0.5   # s, gripper position unchanged this long -> stopped on an object
 GRIPPER_TIMEOUT = 4.0       # s
 
+# Waypoint 9 picks up the hygrostat that fits the measured powder level
+WAYPOINT_NINE_LARGE = [0.2265, 0.1046, 0.0599, -3.1277, -0.0089, 3.1481]
+WAYPOINT_NINE_MEDIUM = [0.2425, 0.1046, 0.0599, -3.1277, -0.0089, 3.1481]
+WAYPOINT_NINE_SMALL = [0.2585, 0.1046, 0.0599, -3.1277, -0.0089, 3.1481]
+WAYPOINT_NINE = {"small": WAYPOINT_NINE_SMALL, "medium": WAYPOINT_NINE_MEDIUM, "large": WAYPOINT_NINE_LARGE}
+
 # ("movej", joints in deg) | ("movel", straight line to [x, y, z, rx, ry, rz] in m / rad) | ("gripper", 0 closed ~ 300 open)
+# | ("measure", None) vision reading of the vial in the pocket, aborts the routine on NO-GO
+# | ("movel_hygrostat", {hygrostat: pose}) movel to the pose of the measured hygrostat
+# | ("movel_level", pose) movel to pose raised in z by the measured powder level
 STEPS = [
     ("gripper", 250),  # waypoint  0 (t=  3.7s)
     ("movej", [114.51, -36.85, -127.23, 65.38, -27.54, 90.18, -24.36]),  # waypoint  0 (t=  3.7s)
@@ -41,14 +56,15 @@ STEPS = [
     ("gripper", 250),  # waypoint  6 (t= 60.0s)
     ("movel", [0.2424, 0.0231, 0.1423, 3.0739, 0.0047, -3.0560]),  # waypoint  7 (t= 66.9s)
     ("movel", [0.2438, 0.1062, 0.1014, 3.0233, 0.0138, -3.1103]),  # waypoint  8 (t= 73.4s)
-    ("movel", [0.2425, 0.1046, 0.0599, -3.1277, -0.0089, 3.1481]),  # waypoint  9 (t= 96.8s)
+    ("measure", None),  # vial is in the pocket and the arm is clear of the camera
+    ("movel_hygrostat", WAYPOINT_NINE),  # waypoint  9 (t= 96.8s)
     ("gripper", 0),  # waypoint 10 (t= 99.9s)
     ("movel", [0.2476, 0.1111, 0.1020, -3.1054, -0.0155, 3.1496]),  # waypoint 11 (t=122.5s)
     ("movel", [0.2448, 0.0345, 0.1513, -3.0730, -0.0315, -3.0957]),  # waypoint 12 (t=131.3s)
     ("movel", [0.2458, 0.0283, 0.0931, 3.1399, -0.0245, -3.0897]),  # waypoint 13 (t=144.4s)
     ("movel", [0.2433, 0.0292, 0.0841, 3.1320, -0.0134, -3.0989]),  # waypoint 14 (t=186.3s)
     ("gripper", 13),  # waypoint 15 (t=202.7s)
-    ("movel", [0.2462, 0.0327, 0.1165, 3.1321, -0.0144, -3.1143]),  # waypoint 16 (t=226.4s)
+    ("movel_level", [0.2462, 0.0327, 0.1165, 3.1321, -0.0144, -3.1143]),  # waypoint 16 (t=226.4s)
     ("gripper", 21),  # waypoint 16 (t=226.4s)
     ("gripper", 250),  # waypoint 17 (t=231.6s)
     ("movel", [0.2427, 0.0261, 0.0958, 3.1321, -0.0009, -3.0957]),  # waypoint 18 (t=242.2s)
@@ -145,16 +161,43 @@ def _movej(robot, joints):
         raise RuntimeError(f"movej failed with ret={ret}")
 
 
+def _measure_vial(vision):
+    vision.new_vial()
+    result = vision.measure()
+    print(f"  Vision: {result}")
+    if result["verdict"] != "GO" or result["hygrostat"] not in WAYPOINT_NINE:
+        raise RuntimeError(f"Vision NO-GO (status {result['status']}, level {result['level_mm']}mm, "
+                           f"hygrostat {result['hygrostat']}), aborting the calorimetry routine")
+    return result
+
+
 def run_calorimetry_routine(robot):
-    """Execute STEPS on a RealManRobotWithDH. Blocks until done, raises on a failed move."""
-    for i, (kind, value) in enumerate(STEPS):
-        print(f"Calorimetry step {i + 1}/{len(STEPS)}: {kind} {value}")
-        if kind == "movej":
-            _movej(robot, value)
-        elif kind == "movel":
-            _move_linear(robot, value)
-        elif kind == "gripper":
-            robot.set_gripper_target(value)
-            _wait_for_gripper(robot, value)
-        else:
-            raise ValueError(f"Unknown routine step: {kind}")
+    """Execute STEPS on a RealManRobotWithDH. Blocks until done, raises on a failed move
+    or a vision NO-GO."""
+    # Open the camera before moving, so a missing camera stops the routine before it starts
+    vision = L2Vision()
+    try:
+        result = None
+        for i, (kind, value) in enumerate(STEPS):
+            print(f"Calorimetry step {i + 1}/{len(STEPS)}: {kind} {value}")
+            if kind == "movej":
+                _movej(robot, value)
+            elif kind == "movel":
+                _move_linear(robot, value)
+            elif kind == "gripper":
+                robot.set_gripper_target(value)
+                _wait_for_gripper(robot, value)
+            elif kind == "measure":
+                result = _measure_vial(vision)
+            elif kind == "movel_hygrostat":
+                print(f"  Hygrostat: {result['hygrostat']}")
+                _move_linear(robot, value[result["hygrostat"]])
+            elif kind == "movel_level":
+                target = list(value)
+                target[2] += result["level_mm"] / 1000.0
+                print(f"  Raised {result['level_mm']}mm for the powder level: z={target[2]:.4f}")
+                _move_linear(robot, target)
+            else:
+                raise ValueError(f"Unknown routine step: {kind}")
+    finally:
+        vision.release()
